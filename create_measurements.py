@@ -36,13 +36,15 @@ def check_args(file_args):
         print("        For example:  1_000_000_000 for one billion")
         exit()
 
+# Adapted from https://simplemaps.com/data/world-cities
+# Licensed under Creative Commons Attribution 4.0 (https://creativecommons.org/licenses/by/4.0/)
 
 def build_weather_station_name_list():
     """
     Grabs the weather station names from example data provided in repo and dedups
     """
     station_names = []
-    with open('../../../data/weather_stations.csv', 'r') as file:
+    with open('weather_stations.csv', 'r', encoding="UTF-8") as file:
         file_contents = file.read()
     for station in file_contents.splitlines():
         if "#" in station:
@@ -111,7 +113,7 @@ def build_test_data(weather_station_names, num_rows_to_create):
     print('Building test data...')
 
     try:
-        with open("../../../data/measurements.txt", 'w') as file:
+        with open("measurements.txt", 'w', encoding="UTF-8") as file:
             progress = 0
             for chunk in range(chunks):
                 
