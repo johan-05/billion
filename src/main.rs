@@ -1,10 +1,16 @@
+use std::boxed::Box;
 use std::collections::HashMap;
+use std::error::Error;
 use std::fs;
-use std::io;
 use std::io::Read;
+use std::mem;
 use std::str;
+use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{self, Sender};
+use std::sync::Mutex;
+use std::thread::{self, JoinHandle};
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 struct City {
     min: i16,
     max: i16,
@@ -12,11 +18,58 @@ struct City {
     count: i32,
 }
 
+struct MainBuffer {
+    data: Vec<u8>,
+    beginning: usize,
+    end: usize,
+}
+
+struct Thread {
+    handle: JoinHandle<HashMap<[u8; 10], City>>,
+    sender: Sender<Option<MainBuffer>>,
+    mutex: &'static Mutex<bool>,
+}
+
+impl Thread {
+    fn new(mutex_ref: &'static Mutex<bool>, city_map: HashMap<[u8; 10], City>) -> Self {
+        let (tx, rx) = mpsc::channel::<Option<MainBuffer>>();
+
+        let handle = thread::spawn(move || {
+            let city_map = thread_loop(rx, mutex_ref, city_map);
+            return city_map;
+        });
+
+        return Thread {
+            handle: handle,
+            sender: tx,
+            mutex: mutex_ref,
+        };
+    }
+
+    fn send(&self, data: MainBuffer) {
+        self.sender.send(Some(data)).unwrap();
+    }
+
+    fn is_ready(&self) -> bool {
+        let ready = self.mutex.lock().unwrap();
+        return *ready;
+    }
+
+    fn close(&self) {
+        self.sender.send(None).unwrap();
+    }
+
+    fn join(self) -> HashMap<[u8; 10], City> {
+        self.handle.join().unwrap()
+    }
+}
+
+
 trait First {
     type Item;
-    fn first_e(&self, token: Self::Item) -> usize;
+    fn first_occur(&self, token: Self::Item) -> usize;
 
-    fn last_e(&self, token: Self::Item) -> usize;
+    fn last_occur(&self, token: Self::Item) -> usize;
 }
 
 impl<T> First for Vec<T>
@@ -24,8 +77,7 @@ where
     T: PartialEq,
 {
     type Item = T;
-
-    fn first_e(&self, token: T) -> usize {
+    fn first_occur(&self, token: T) -> usize {
         let mut idx = 0;
         while self[idx] != token {
             idx += 1;
@@ -33,7 +85,7 @@ where
         return idx;
     }
 
-    fn last_e(&self, token: T) -> usize {
+    fn last_occur(&self, token: T) -> usize {
         let mut idx = self.len() - 1;
         while self[idx] != token {
             idx -= 1;
@@ -48,7 +100,7 @@ where
 {
     type Item = T;
 
-    fn first_e(&self, token: T) -> usize {
+    fn first_occur(&self, token: T) -> usize {
         let mut idx = 0;
         while self[idx] != token {
             idx += 1;
@@ -56,7 +108,7 @@ where
         return idx;
     }
 
-    fn last_e(&self, token: T) -> usize {
+    fn last_occur(&self, token: T) -> usize {
         let mut idx = self.len() - 1;
         while self[idx] != token {
             idx -= 1;
@@ -84,7 +136,7 @@ where
     }
 
     fn extend(&mut self, slice: &[T], first: T) {
-        let offset = self.first_e(first);
+        let offset = self.first_occur(first);
         for (i, n) in slice.iter().enumerate() {
             self[offset + i] = *n;
         }
@@ -93,6 +145,8 @@ where
 
 trait DecodeCity {
     fn decode_slice(&mut self, slice: &[u8]);
+
+    fn merge(&mut self, thread_map: Self);
 }
 
 impl DecodeCity for HashMap<[u8; 10], City> {
@@ -151,11 +205,65 @@ impl DecodeCity for HashMap<[u8; 10], City> {
             }
         }
     }
+
+    fn merge(&mut self, thread_map: HashMap<[u8; 10], City>) {
+        for key in thread_map.keys(){
+            let merge_city = thread_map.get(key).unwrap();
+            match self.get_mut(key) {
+                Some(city) => {
+                    city.count += merge_city.count;
+                    city.sum += merge_city.sum;
+                    if merge_city.max > city.max {
+                        city.max = merge_city.max;
+                    }
+                    if merge_city.min < city.min {
+                        city.min = merge_city.min;
+                    }
+                }
+                None => {
+                    self.insert(*key, merge_city.clone());
+                }
+            }
+        }
+    }
+}
+
+fn thread_loop(
+    rx: Receiver<Option<MainBuffer>>,
+    mutex_ref: &'static Mutex<bool>,
+    mut city_map: HashMap<[u8; 10], City>,
+) -> HashMap<[u8; 10], City> {
+    'thread_loop: loop {
+        let main_buffer_option = rx.recv().unwrap();
+        match main_buffer_option {
+            Some(main_buffer) => {
+                let data = main_buffer.data[main_buffer.beginning..main_buffer.end].as_ref();
+                let mut counter = 0;
+                let mut ready = mutex_ref.lock().unwrap();
+                *ready = false;
+                mem::drop(ready);
+
+                for l in data.split(|b| *b == b'\r') {
+                    counter += 1;
+                    if l.len() <= 1 {
+                        println!("cancelled, {}, {:?}", counter, l);
+                        panic!();
+                        //continue;
+                    }
+                    city_map.decode_slice(&l[1..]);
+                }
+                let mut ready = mutex_ref.lock().unwrap();
+                *ready = true;
+                mem::drop(ready);
+            }
+            None => break 'thread_loop,
+        }
+    }
+    return city_map;
 }
 
 fn parse_num(input: &[u8]) -> i16 {
     let negative = input[0] == 0x2D;
-    println!("{:?}", input);
     let len = input.len();
 
     let (d1, d2, d3) = match (negative, len) {
@@ -163,7 +271,10 @@ fn parse_num(input: &[u8]) -> i16 {
         (false, 4) => (input[0] - b'0', input[1] - b'0', input[3] - b'0'),
         (true, 4) => (0, input[1] - b'0', input[3] - b'0'),
         (true, 5) => (input[1] - b'0', input[2] - b'0', input[4] - b'0'),
-        _ => unreachable!(),
+        _ => {
+            println!("{:?}", str::from_utf8(input));
+            panic!()
+        }
     };
     let int = (d1 as i16 * 100) + (d2 as i16 * 10) + d3 as i16;
     let int = if negative { -int } else { int };
@@ -171,50 +282,82 @@ fn parse_num(input: &[u8]) -> i16 {
 }
 
 const BUF_SIZE: usize = 512 * 512;
+const THREAD_COUNT: usize = 5;
 
-fn main() -> io::Result<()> {
+fn main() -> Result<(), Box<dyn Error>> {
     let mut f = fs::File::open("measurements.txt")?;
-    let mut buff = vec![0; BUF_SIZE];
     let mut overflow_buffer = [0u8; 60];
-    let start = std::time::Instant::now();
+    overflow_buffer[0] = b'\r';
+
     let mut city_map: HashMap<[u8; 10], City> = HashMap::new();
+    let start = std::time::Instant::now();
+
+    let mut thread_pool = Vec::new();
+
+    for _ in 0..THREAD_COUNT {
+        let ready_mutex = Box::leak(Box::new(Mutex::new(true)));
+        let citymap_ref: HashMap<[u8; 10], City> = HashMap::new();
+        let thread = Thread::new(ready_mutex, citymap_ref);
+        thread_pool.push(thread);
+    }
 
     'main: loop {
+        let mut buff = vec![0; BUF_SIZE];
+
         match f.read(&mut buff) {
             Ok(ref n) if *n == BUF_SIZE => {
-                let first_n = buff.first_e(0xA);
-                let last_n = buff.last_e(0xA);
+                let first_r = buff.first_occur(b'\r');
+                let last_r = buff.last_occur(b'\r');
 
-                let overflow_end = buff[0..first_n].as_ref();
+                let overflow_end = buff[0..first_r].as_ref();
                 overflow_buffer.extend(overflow_end, 0);
-                let semi = overflow_buffer.first_e(0);
-                let overflow_slice = &overflow_buffer[1..semi];
-                let main_buffer = buff[first_n + 1..last_n - 1].as_mut();
+                let semi = overflow_buffer.first_occur(0);
+                let overflow_slice = &overflow_buffer[0..semi];
 
-                city_map.decode_slice(&overflow_slice[0..overflow_slice.len() - 1]);
-                for l in main_buffer.split_mut(|b| *b == 0xA) {
-                    city_map.decode_slice(&l[0..l.len() - 1]);
-                }
+                city_map.decode_slice(&overflow_slice[1..]);
 
-                let overflow_start = buff[last_n + 1..].as_ref();
+                let overflow_start = buff[last_r + 1..].as_ref();
                 overflow_buffer.fill(0);
                 overflow_buffer.write(overflow_start);
-            }
-            Ok(n) => {
-                let first_n = buff.first_e(0xA);
 
-                let overflow_end = buff[0..first_n].as_ref();
-                overflow_buffer.extend(overflow_end, 0);
-                let semi = overflow_buffer.first_e(0);
-                let overflow_slice = &overflow_buffer[1..semi];
-                let main_buffer = buff[first_n + 1..n].as_mut();
+                let main_buffer = MainBuffer {
+                    data: buff,
+                    beginning: first_r + 1,
+                    end: last_r,
+                };
 
-                city_map.decode_slice(overflow_slice);
-                for l in main_buffer.split_mut(|b| *b == 0xA) {
-                    if l.len() == 0 {
-                        continue;
+                for thread in &thread_pool {
+                    if thread.is_ready() {
+                        thread.send(main_buffer);
+                        break;
                     }
-                    city_map.decode_slice(l);
+                }
+            }
+            Ok(_) => {
+                println!("last batch");
+                let first_r = buff.first_occur(b'\r');
+                let last_r = buff.last_occur(b'\r');
+
+
+                let overflow_end = buff[0..first_r].as_ref();
+                overflow_buffer.extend(overflow_end, 0);
+                let semi = overflow_buffer.first_occur(0);
+                let overflow_slice = &overflow_buffer[0..semi];
+                let main_buffer = MainBuffer {
+                    data: buff,
+                    beginning: first_r + 1,
+                    end: last_r
+                };
+
+                if overflow_slice.len() != 0 {
+                    city_map.decode_slice(&overflow_slice[1..]);
+                }
+
+                for thread in &thread_pool {
+                    if thread.is_ready() {
+                        thread.send(main_buffer);
+                        break;
+                    }
                 }
 
                 break 'main;
@@ -223,6 +366,12 @@ fn main() -> io::Result<()> {
                 panic!("{}", e)
             }
         }
+    }
+
+    for thread in thread_pool {
+        thread.close();
+        let thread_map = thread.join();
+        city_map.merge(thread_map);
     }
 
     for key in city_map.keys() {
