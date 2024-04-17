@@ -1,14 +1,16 @@
-use std::boxed::Box;
-use std::collections::HashMap;
-use std::error::Error;
-use std::fs;
-use std::io::Read;
-use std::mem;
-use std::str;
-use std::sync::mpsc::Receiver;
-use std::sync::mpsc::{self, Sender};
-use std::sync::Mutex;
-use std::thread::{self, JoinHandle};
+use std::{
+    boxed::Box,
+    collections::HashMap,
+    error::Error,
+    fs,
+    io::{self, Read, Write},
+    mem, str,
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        Mutex,
+    },
+    thread::{self, JoinHandle},
+};
 
 #[derive(Debug, Copy, Clone)]
 struct City {
@@ -25,13 +27,13 @@ struct MainBuffer {
 }
 
 struct Thread {
-    handle: JoinHandle<HashMap<[u8; 10], City>>,
+    handle: JoinHandle<HashMap<[u8; 36], City>>,
     sender: Sender<Option<MainBuffer>>,
-    mutex: &'static Mutex<bool>,
+    ready_mutex: &'static Mutex<bool>,
 }
 
 impl Thread {
-    fn new(mutex_ref: &'static Mutex<bool>, city_map: HashMap<[u8; 10], City>) -> Self {
+    fn new(mutex_ref: &'static Mutex<bool>, city_map: HashMap<[u8; 36], City>) -> Self {
         let (tx, rx) = mpsc::channel::<Option<MainBuffer>>();
 
         let handle = thread::spawn(move || {
@@ -42,7 +44,7 @@ impl Thread {
         return Thread {
             handle: handle,
             sender: tx,
-            mutex: mutex_ref,
+            ready_mutex: mutex_ref,
         };
     }
 
@@ -51,7 +53,7 @@ impl Thread {
     }
 
     fn is_ready(&self) -> bool {
-        let ready = self.mutex.lock().unwrap();
+        let ready = self.ready_mutex.lock().unwrap();
         return *ready;
     }
 
@@ -59,11 +61,10 @@ impl Thread {
         self.sender.send(None).unwrap();
     }
 
-    fn join(self) -> HashMap<[u8; 10], City> {
+    fn join(self) -> HashMap<[u8; 36], City> {
         self.handle.join().unwrap()
     }
 }
-
 
 trait First {
     type Item;
@@ -149,39 +150,14 @@ trait DecodeCity {
     fn merge(&mut self, thread_map: Self);
 }
 
-impl DecodeCity for HashMap<[u8; 10], City> {
+impl DecodeCity for HashMap<[u8; 36], City> {
     fn decode_slice(&mut self, slice: &[u8]) {
-        let mut city_buf = [0; 10];
-        let mut counter = 0;
-        let mut found_semi = 0;
-        while counter < 10 {
-            if found_semi == 0 {
-                city_buf[counter] = slice[counter];
-            } else {
-                city_buf[counter] = 0;
-                counter += 1;
-                continue;
-            }
-            if slice[counter] == ';' as u8 {
-                found_semi = counter
-            }
-            counter += 1;
-        }
+        let mut city_buf = [0; 36];
+        let semi_location = slice.first_occur(b';');
+        city_buf.write(&slice[0..semi_location]);
 
-        let num: &[u8];
-        if found_semi != 0 {
-            num = &slice[found_semi + 1..];
-        } else {
-            loop {
-                if slice[counter] == ';' as u8 {
-                    break;
-                }
-                counter += 1;
-            }
-            num = &slice[counter + 1..];
-        }
-
-        let temp = parse_num(num);
+        let number_slice = &slice[semi_location + 1..];
+        let temp = parse_num(number_slice);
 
         match self.get_mut(&city_buf) {
             Some(city) => {
@@ -206,8 +182,8 @@ impl DecodeCity for HashMap<[u8; 10], City> {
         }
     }
 
-    fn merge(&mut self, thread_map: HashMap<[u8; 10], City>) {
-        for key in thread_map.keys(){
+    fn merge(&mut self, thread_map: HashMap<[u8; 36], City>) {
+        for key in thread_map.keys() {
             let merge_city = thread_map.get(key).unwrap();
             match self.get_mut(key) {
                 Some(city) => {
@@ -231,25 +207,18 @@ impl DecodeCity for HashMap<[u8; 10], City> {
 fn thread_loop(
     rx: Receiver<Option<MainBuffer>>,
     mutex_ref: &'static Mutex<bool>,
-    mut city_map: HashMap<[u8; 10], City>,
-) -> HashMap<[u8; 10], City> {
+    mut city_map: HashMap<[u8; 36], City>,
+) -> HashMap<[u8; 36], City> {
     'thread_loop: loop {
         let main_buffer_option = rx.recv().unwrap();
         match main_buffer_option {
             Some(main_buffer) => {
                 let data = main_buffer.data[main_buffer.beginning..main_buffer.end].as_ref();
-                let mut counter = 0;
                 let mut ready = mutex_ref.lock().unwrap();
                 *ready = false;
                 mem::drop(ready);
 
                 for l in data.split(|b| *b == b'\r') {
-                    counter += 1;
-                    if l.len() <= 1 {
-                        println!("cancelled, {}, {:?}", counter, l);
-                        panic!();
-                        //continue;
-                    }
                     city_map.decode_slice(&l[1..]);
                 }
                 let mut ready = mutex_ref.lock().unwrap();
@@ -273,7 +242,7 @@ fn parse_num(input: &[u8]) -> i16 {
         (true, 5) => (input[1] - b'0', input[2] - b'0', input[4] - b'0'),
         _ => {
             println!("{:?}", str::from_utf8(input));
-            panic!()
+            panic!("parse num oppsied");
         }
     };
     let int = (d1 as i16 * 100) + (d2 as i16 * 10) + d3 as i16;
@@ -281,22 +250,90 @@ fn parse_num(input: &[u8]) -> i16 {
     int
 }
 
+fn print_results(city_map: HashMap<[u8; 36], City>) -> (i32, i32) {
+    let mut result = Vec::with_capacity(500000);
+    let mut line_count = 0;
+    let mut key_count = 0;
+    for key in city_map.keys() {
+        let city = city_map.get(key).unwrap();
+        line_count += city.count;
+        key_count += 1;
+        let result_str = stringify_result(city);
+
+        result.append(&mut key.to_vec());
+        result.push(b' ');
+        result.append(&mut result_str.as_bytes().to_vec());
+        result.push(b'\n');
+    }
+
+    io::stdout().lock().write_all(&result).unwrap();
+
+    return (line_count, key_count);
+}
+
+fn stringify_result(city: &City) -> String {
+    let mut ret_str = String::with_capacity(15);
+    let abs_min: i16;
+    if city.min < 0 {
+        ret_str.push('-');
+        abs_min = -city.min;
+    } else {
+        abs_min = city.min;
+    }
+
+    ret_str.push((abs_min / 100 + 48) as u8 as char);
+    ret_str.push((((abs_min % 100) / 10) + 48) as u8 as char);
+    ret_str.push('.');
+    ret_str.push((abs_min % 10 + 48) as u8 as char);
+    ret_str.push('/');
+
+    let average = city.sum / city.count;
+    let abs_avg: i32;
+    if average < 0 {
+        ret_str.push('-');
+        abs_avg = -average;
+    } else {
+        abs_avg = average;
+    }
+
+    ret_str.push((abs_avg / 100 + 48) as u8 as char);
+    ret_str.push((((abs_avg % 100) / 10) + 48) as u8 as char);
+    ret_str.push('.');
+    ret_str.push((abs_avg % 10 + 48) as u8 as char);
+    ret_str.push('/');
+
+    let abs_max: i16;
+    if city.max < 0 {
+        ret_str.push('-');
+        abs_max = -city.max;
+    } else {
+        abs_max = city.max;
+    }
+
+    ret_str.push((abs_max / 100 + 48) as u8 as char);
+    ret_str.push((((abs_max % 100) / 10) + 48) as u8 as char);
+    ret_str.push('.');
+    ret_str.push((abs_max % 10 + 48) as u8 as char);
+
+    ret_str
+}
+
 const BUF_SIZE: usize = 512 * 512;
-const THREAD_COUNT: usize = 5;
+const THREAD_COUNT: usize = 7;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut f = fs::File::open("measurements.txt")?;
     let mut overflow_buffer = [0u8; 60];
     overflow_buffer[0] = b'\r';
 
-    let mut city_map: HashMap<[u8; 10], City> = HashMap::new();
+    let mut city_map: HashMap<[u8; 36], City> = HashMap::new();
     let start = std::time::Instant::now();
 
     let mut thread_pool = Vec::new();
 
     for _ in 0..THREAD_COUNT {
         let ready_mutex = Box::leak(Box::new(Mutex::new(true)));
-        let citymap_ref: HashMap<[u8; 10], City> = HashMap::new();
+        let citymap_ref: HashMap<[u8; 36], City> = HashMap::new();
         let thread = Thread::new(ready_mutex, citymap_ref);
         thread_pool.push(thread);
     }
@@ -326,18 +363,18 @@ fn main() -> Result<(), Box<dyn Error>> {
                     end: last_r,
                 };
 
-                for thread in &thread_pool {
-                    if thread.is_ready() {
-                        thread.send(main_buffer);
-                        break;
+                'thread_polling: loop {
+                    for thread in &thread_pool {
+                        if thread.is_ready() {
+                            thread.send(main_buffer);
+                            break 'thread_polling;
+                        }
                     }
                 }
             }
             Ok(_) => {
-                println!("last batch");
                 let first_r = buff.first_occur(b'\r');
                 let last_r = buff.last_occur(b'\r');
-
 
                 let overflow_end = buff[0..first_r].as_ref();
                 overflow_buffer.extend(overflow_end, 0);
@@ -346,12 +383,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let main_buffer = MainBuffer {
                     data: buff,
                     beginning: first_r + 1,
-                    end: last_r
+                    end: last_r,
                 };
 
-                if overflow_slice.len() != 0 {
-                    city_map.decode_slice(&overflow_slice[1..]);
-                }
+                city_map.decode_slice(&overflow_slice[1..]);
 
                 for thread in &thread_pool {
                     if thread.is_ready() {
@@ -374,14 +409,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         city_map.merge(thread_map);
     }
 
-    for key in city_map.keys() {
-        let city = city_map.get(key).unwrap();
-        println!("{:?}, {:?}", str::from_utf8(key), city);
-    }
+    let (line_count, key_count) = print_results(city_map);
 
     let after = std::time::Instant::now();
     let time = after - start;
-    println!("duration: {}", time.as_millis());
+    println!(
+        "duration: {}, amount: {}, keys: {}",
+        time.as_millis(),
+        line_count,
+        key_count
+    );
 
     Ok(())
 }
